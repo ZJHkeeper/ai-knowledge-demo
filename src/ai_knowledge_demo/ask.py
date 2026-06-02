@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,10 @@ from ai_knowledge_demo.ingest import DEFAULT_COLLECTION, DEFAULT_PERSIST_DIR
 DEFAULT_MODEL = "qwen2.5:7b"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_TOP_K = 4
+DEFAULT_MIN_RECALL = 20
+DEFAULT_RECALL_MULTIPLIER = 5
 NO_CONTEXT_MESSAGE = "\u77e5\u8bc6\u5e93\u4e2d\u6ca1\u6709\u627e\u5230\u76f8\u5173\u4fe1\u606f\u3002"
+HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -60,15 +64,21 @@ def retrieve_chunks(
 
     client = chromadb.PersistentClient(path=str(persist_dir))
     collection = client.get_collection(name=collection_name)
-    if collection.count() == 0:
+    collection_count = collection.count()
+    if collection_count == 0:
         return []
 
+    candidate_count = min(
+        collection_count,
+        max(top_k * DEFAULT_RECALL_MULTIPLIER, DEFAULT_MIN_RECALL),
+    )
     result = collection.query(
         query_texts=[question],
-        n_results=top_k,
+        n_results=candidate_count,
         include=["documents", "metadatas", "distances"],
     )
-    return chunks_from_query_result(result)
+    candidates = chunks_from_query_result(result)
+    return rerank_chunks(question, candidates, top_k)
 
 
 def chunks_from_query_result(result: Mapping[str, Any]) -> list[RetrievedChunk]:
@@ -112,6 +122,79 @@ def format_source(metadata: Mapping[str, Any]) -> str:
     if chunk_index is None:
         return source
     return f"{source}#chunk={chunk_index}"
+
+
+def rerank_chunks(
+    question: str,
+    chunks: list[RetrievedChunk],
+    top_k: int,
+) -> list[RetrievedChunk]:
+    """Rerank vector candidates with lightweight keyword matching."""
+
+    if top_k <= 0:
+        raise ValueError("top_k must be greater than 0")
+    if not chunks:
+        return []
+
+    scored_chunks = [
+        (
+            -keyword_score(question, chunk),
+            chunk.distance if chunk.distance is not None else float("inf"),
+            index,
+            chunk,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    return [chunk for *_unused, chunk in sorted(scored_chunks)[:top_k]]
+
+
+def keyword_score(question: str, chunk: RetrievedChunk) -> float:
+    """Score how well a chunk matches question keywords."""
+
+    terms = extract_query_terms(question)
+    if not terms:
+        return 0.0
+
+    title = _first_heading(chunk.text)
+    title_lower = title.lower()
+    body_lower = chunk.text.lower()
+    score = 0.0
+
+    for term in terms:
+        term_lower = term.lower()
+        weight = len(term_lower)
+        if term_lower in title_lower:
+            score += 6.0 + weight
+        if term_lower in body_lower:
+            score += 1.5 + weight / 2.0
+
+    compact_question = _compact_text(question)
+    compact_text = _compact_text(chunk.text)
+    if len(compact_question) >= 4 and compact_question in compact_text:
+        score += 12.0
+
+    return score
+
+
+def extract_query_terms(question: str) -> list[str]:
+    """Extract Chinese n-grams and alphanumeric keywords from a question."""
+
+    terms: set[str] = set()
+    for match in re.finditer(r"[A-Za-z0-9]+", question):
+        value = match.group(0).lower()
+        if len(value) >= 2:
+            terms.add(value)
+
+    for match in re.finditer(r"[\u4e00-\u9fff]+", question):
+        value = match.group(0)
+        if len(value) >= 2:
+            terms.add(value)
+        for size in (2, 3):
+            if len(value) >= size:
+                for index in range(len(value) - size + 1):
+                    terms.add(value[index : index + size])
+
+    return sorted(terms, key=lambda term: (-len(term), term))
 
 
 def answer_question(
@@ -236,6 +319,17 @@ def _first_result_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return []
+
+
+def _first_heading(text: str) -> str:
+    match = HEADING_RE.search(text)
+    if match is None:
+        return ""
+    return match.group(1)
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
 
 
 if __name__ == "__main__":

@@ -86,6 +86,8 @@ ai-knowledge-ask "退款多久到账？"
 .\.venv\Scripts\python -m ai_knowledge_demo.ask "退款多久到账？" --top-k 4 --persist-dir chroma_db --collection ai_knowledge_demo --model qwen2.5:7b --ollama-url http://localhost:11434
 ```
 
+`--top-k` 表示最终交给 Ollama 的 chunk 数量。脚本内部会自动扩大 Chroma 候选召回，并用问题关键词对候选 chunk 重排，降低答案 chunk 被向量检索排到后面而漏掉的概率。
+
 如需换模型，可以直接传参数：
 
 ```powershell
@@ -107,7 +109,7 @@ $env:OLLAMA_URL = "http://localhost:11434"
 
 重复运行入库脚本时，会替换同一个 `source` 下的旧 chunk，避免文档更新后残留旧内容。向量生成使用 Chroma 默认 embedding，首次运行时 Chroma 可能会下载默认的本地 embedding 模型。
 
-`ai_knowledge_demo.ask` 会复用入库模块的默认 Chroma 路径和 collection 名称，先用 Chroma `query()` 检索 top-k chunk，再把带来源标签的上下文交给 Ollama `/api/chat` 生成中文回答。
+`ai_knowledge_demo.ask` 会复用入库模块的默认 Chroma 路径和 collection 名称，先用 Chroma `query()` 扩大召回候选，再用轻量关键词重排选出最终 top-k chunk，最后把带来源标签的上下文交给 Ollama `/api/chat` 生成中文回答。
 
 手动查看切分结果可以直接调用 `chunk_markdown`：
 
