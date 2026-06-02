@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 ai-knowledge-demo = "ai_knowledge_demo.cli:main"
 ai-knowledge-ingest = "ai_knowledge_demo.ingest:main"
+ai-knowledge-ask = "ai_knowledge_demo.ask:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

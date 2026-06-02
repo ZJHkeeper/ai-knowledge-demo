@@ -1,58 +1,113 @@
 # ai-knowledge-demo
 
-A standard Python package scaffold for AI knowledge experiments.
+一个最小 RAG 示例项目：把 `data/` 里的 Markdown 文档写入本地 Chroma 向量库，然后从 Chroma 检索上下文并调用本地 Ollama 模型回答问题。
 
 ## Setup
 
-Create the virtual environment:
+创建虚拟环境：
 
 ```powershell
 python -m venv .venv
 ```
 
-Activate it:
+激活虚拟环境：
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-Run tests:
+安装项目依赖：
+
+```powershell
+.\.venv\Scripts\python -m pip install -e .
+```
+
+运行测试：
 
 ```powershell
 .\.venv\Scripts\python -m unittest discover
 ```
 
-Run the CLI module:
+## Ollama
+
+安装并启动 Ollama 后，拉取默认问答模型：
 
 ```powershell
-.\.venv\Scripts\python -m ai_knowledge_demo.cli
+ollama pull qwen2.5:7b
 ```
 
-Ingest Markdown files from `data/` into the local Chroma database:
+确认 Ollama 正在运行：
+
+```powershell
+ollama list
+```
+
+默认连接地址是 `http://localhost:11434`，默认模型是 `qwen2.5:7b`。
+
+## Ingest
+
+将 `data/` 下的 Markdown 文件写入本地 Chroma 数据库：
 
 ```powershell
 .\.venv\Scripts\python -m ai_knowledge_demo.ingest
 ```
 
-## 设计思路
+也可以使用安装后的命令入口：
 
-这个项目把 Markdown 知识文档作为最小数据源，默认从项目根目录的 `data/`
-文件夹递归读取 `.md` 文件，再写入本地持久化 Chroma 向量数据库 `chroma_db/`。
-入库脚本放在 `ai_knowledge_demo.ingest` 模块中，便于后续被 CLI、测试或其他
-RAG 流程复用。
+```powershell
+ai-knowledge-ingest
+```
 
-文档切分采用“先按 Markdown 结构分段，再按长度兜底切分”的策略。脚本会优先
-根据标题行和 `---` 分隔线确定语义边界；如果某个段落超过默认 `800` 字符，
-再按固定窗口切分，并保留 `100` 字符 overlap，降低上下文在 chunk 边界处丢失
-的概率。
+默认配置：
 
-每个 chunk 都会写入稳定的 metadata，包括 `source`、`chunk_index`、
-`start_char` 和 `end_char`。其中 `source` 使用相对于 `data/` 的路径，
-方便追踪 chunk 来自哪份原始文档；字符范围则方便手动核对切分结果。
+- 数据目录：`data/`
+- Chroma 持久化目录：`chroma_db/`
+- Collection：`ai_knowledge_demo`
+- Chunk 大小：`800`
+- Chunk overlap：`100`
 
-重复运行入库脚本时，会先删除同一 `source` 已有的 chunk，再写入新 chunk，
-避免文档更新后旧内容残留。向量生成使用 Chroma 默认 embedding，因此无需额外
-配置 API key；首次运行时 Chroma 可能会下载默认的本地 embedding 模型。
+## Ask
+
+从 Chroma 检索并调用本地 Ollama 回答：
+
+```powershell
+.\.venv\Scripts\python -m ai_knowledge_demo.ask "退款多久到账？"
+```
+
+也可以使用安装后的命令入口：
+
+```powershell
+ai-knowledge-ask "退款多久到账？"
+```
+
+可选参数：
+
+```powershell
+.\.venv\Scripts\python -m ai_knowledge_demo.ask "退款多久到账？" --top-k 4 --persist-dir chroma_db --collection ai_knowledge_demo --model qwen2.5:7b --ollama-url http://localhost:11434
+```
+
+如需换模型，可以直接传参数：
+
+```powershell
+.\.venv\Scripts\python -m ai_knowledge_demo.ask "退款多久到账？" --model llama3.1:8b
+```
+
+也可以用环境变量设置默认值：
+
+```powershell
+$env:OLLAMA_MODEL = "qwen2.5:7b"
+$env:OLLAMA_URL = "http://localhost:11434"
+```
+
+回答会只基于检索到的知识库上下文生成，并在末尾列出来源，例如 `refund_policy.md#chunk=13`。如果知识库中没有相关上下文，会提示：`知识库中没有找到相关信息。`
+
+## Design
+
+`ai_knowledge_demo.ingest` 会递归读取 `data/` 中的 `.md` 文件，按 Markdown 标题和 `---` 分隔线优先切分，再按长度兜底切分。每个 chunk 都会写入稳定 metadata，包括 `source`、`chunk_index`、`start_char` 和 `end_char`。
+
+重复运行入库脚本时，会替换同一个 `source` 下的旧 chunk，避免文档更新后残留旧内容。向量生成使用 Chroma 默认 embedding，首次运行时 Chroma 可能会下载默认的本地 embedding 模型。
+
+`ai_knowledge_demo.ask` 会复用入库模块的默认 Chroma 路径和 collection 名称，先用 Chroma `query()` 检索 top-k chunk，再把带来源标签的上下文交给 Ollama `/api/chat` 生成中文回答。
 
 手动查看切分结果可以直接调用 `chunk_markdown`：
 
