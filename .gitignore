@@ -12,3 +12,4 @@ dist/
 .ruff_cache/
 .coverage
 htmlcov/
+chroma_db/

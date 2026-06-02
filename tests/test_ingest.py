@@ -1,0 +1,51 @@
+import sys
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from ingest import chunk_markdown
+
+
+class IngestChunkTests(unittest.TestCase):
+    def test_short_markdown_stays_in_one_chunk(self) -> None:
+        text = "# Refunds\n\nRefund requests must be filed within 7 days."
+
+        chunks = chunk_markdown(text, "refund_policy.md", chunk_size=800, chunk_overlap=100)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].text, text)
+        self.assertEqual(chunks[0].metadata["source"], "refund_policy.md")
+        self.assertEqual(chunks[0].metadata["chunk_index"], 0)
+        self.assertEqual(chunks[0].metadata["start_char"], 0)
+        self.assertEqual(chunks[0].metadata["end_char"], len(text))
+
+    def test_long_paragraph_uses_size_and_overlap(self) -> None:
+        text = "a" * 25
+
+        chunks = chunk_markdown(text, "long.md", chunk_size=10, chunk_overlap=3)
+
+        self.assertEqual([chunk.text for chunk in chunks], ["a" * 10, "a" * 10, "a" * 10, "a" * 4])
+        self.assertEqual(
+            [(chunk.metadata["start_char"], chunk.metadata["end_char"]) for chunk in chunks],
+            [(0, 10), (7, 17), (14, 24), (21, 25)],
+        )
+
+    def test_metadata_is_stable_across_markdown_sections(self) -> None:
+        text = "# One\n\nFirst section.\n\n---\n\n## Two\n\nSecond section."
+
+        chunks = chunk_markdown(text, "nested/refund_policy.md", chunk_size=800, chunk_overlap=100)
+
+        self.assertEqual([chunk.metadata["chunk_index"] for chunk in chunks], [0, 1, 2])
+        self.assertEqual(
+            [chunk.metadata["source"] for chunk in chunks],
+            ["nested/refund_policy.md", "nested/refund_policy.md", "nested/refund_policy.md"],
+        )
+        self.assertEqual(chunks[0].text, "# One\n\nFirst section.")
+        self.assertEqual(chunks[1].text, "---")
+        self.assertEqual(chunks[2].text, "## Two\n\nSecond section.")
+
+
+if __name__ == "__main__":
+    unittest.main()
