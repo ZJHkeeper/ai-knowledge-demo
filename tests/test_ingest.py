@@ -3,9 +3,10 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+SRC_DIR = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_DIR))
 
-from ingest import chunk_markdown
+from ai_knowledge_demo.ingest import chunk_markdown
 
 
 class IngestChunkTests(unittest.TestCase):

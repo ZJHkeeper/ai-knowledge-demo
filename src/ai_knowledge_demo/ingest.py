@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "chroma_db"
 DEFAULT_COLLECTION = "ai_knowledge_demo"

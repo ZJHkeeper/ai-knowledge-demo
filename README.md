@@ -27,3 +27,9 @@ Run the CLI module:
 ```powershell
 .\.venv\Scripts\python -m ai_knowledge_demo.cli
 ```
+
+Ingest Markdown files from `data/` into the local Chroma database:
+
+```powershell
+.\.venv\Scripts\python -m ai_knowledge_demo.ingest
+```
