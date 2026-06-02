@@ -15,6 +15,8 @@ DEFAULT_PERSIST_DIR = PROJECT_ROOT / "chroma_db"
 DEFAULT_COLLECTION = "ai_knowledge_demo"
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
+HEADING_RE = re.compile(r"^[ \t]*#{1,6}\s+.+$")
+THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,}|(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$")
 
 
 @dataclass(frozen=True)
@@ -172,18 +174,28 @@ def main() -> int:
 
 
 def _markdown_spans(text: str) -> list[tuple[int, int]]:
-    boundaries = [0]
-    for match in re.finditer(r"(?m)^(?:#{1,6}\s+.+|---\s*)$", text):
-        if match.start() not in boundaries:
-            boundaries.append(match.start())
-    boundaries.append(len(text))
-    boundaries = sorted(set(boundaries))
-
     spans: list[tuple[int, int]] = []
-    for start, end in zip(boundaries, boundaries[1:]):
-        trimmed = _trim_span(text, start, end)
-        if trimmed is not None:
-            spans.append(trimmed)
+    span_start = 0
+
+    for line in re.finditer(r".*(?:\r?\n|$)", text):
+        if line.start() == line.end():
+            continue
+
+        line_text = line.group(0).rstrip("\r\n")
+        if HEADING_RE.match(line_text):
+            trimmed = _trim_span(text, span_start, line.start())
+            if trimmed is not None:
+                spans.append(trimmed)
+            span_start = line.start()
+        elif THEMATIC_BREAK_RE.match(line_text):
+            trimmed = _trim_span(text, span_start, line.start())
+            if trimmed is not None:
+                spans.append(trimmed)
+            span_start = line.end()
+
+    trimmed = _trim_span(text, span_start, len(text))
+    if trimmed is not None:
+        spans.append(trimmed)
     return spans
 
 

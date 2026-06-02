@@ -103,7 +103,7 @@ $env:OLLAMA_URL = "http://localhost:11434"
 
 ## Design
 
-`ai_knowledge_demo.ingest` 会递归读取 `data/` 中的 `.md` 文件，按 Markdown 标题和 `---` 分隔线优先切分，再按长度兜底切分。每个 chunk 都会写入稳定 metadata，包括 `source`、`chunk_index`、`start_char` 和 `end_char`。
+`ai_knowledge_demo.ingest` 会递归读取 `data/` 中的 `.md` 文件，按 Markdown 标题和分隔线优先切分，再按长度兜底切分。分隔线只作为 chunk 边界，不会作为独立内容写入 Chroma。每个 chunk 都会写入稳定 metadata，包括 `source`、`chunk_index`、`start_char` 和 `end_char`。
 
 重复运行入库脚本时，会替换同一个 `source` 下的旧 chunk，避免文档更新后残留旧内容。向量生成使用 Chroma 默认 embedding，首次运行时 Chroma 可能会下载默认的本地 embedding 模型。
 

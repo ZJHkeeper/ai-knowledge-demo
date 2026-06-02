@@ -38,14 +38,29 @@ class IngestChunkTests(unittest.TestCase):
 
         chunks = chunk_markdown(text, "nested/refund_policy.md", chunk_size=800, chunk_overlap=100)
 
-        self.assertEqual([chunk.metadata["chunk_index"] for chunk in chunks], [0, 1, 2])
+        self.assertEqual([chunk.metadata["chunk_index"] for chunk in chunks], [0, 1])
         self.assertEqual(
             [chunk.metadata["source"] for chunk in chunks],
-            ["nested/refund_policy.md", "nested/refund_policy.md", "nested/refund_policy.md"],
+            ["nested/refund_policy.md", "nested/refund_policy.md"],
         )
         self.assertEqual(chunks[0].text, "# One\n\nFirst section.")
-        self.assertEqual(chunks[1].text, "---")
-        self.assertEqual(chunks[2].text, "## Two\n\nSecond section.")
+        self.assertEqual(chunks[1].text, "## Two\n\nSecond section.")
+
+    def test_thematic_breaks_only_split_sections(self) -> None:
+        text = "# One\n\nFirst\n\n***\n\n## Two\n\nSecond\n\n___\n\n## Three\n\nThird\n\n- - -\n\n## Four\n\nFourth"
+
+        chunks = chunk_markdown(text, "breaks.md", chunk_size=800, chunk_overlap=100)
+
+        self.assertEqual(
+            [chunk.text for chunk in chunks],
+            [
+                "# One\n\nFirst",
+                "## Two\n\nSecond",
+                "## Three\n\nThird",
+                "## Four\n\nFourth",
+            ],
+        )
+        self.assertFalse(any(chunk.text.strip() in {"---", "***", "___", "- - -"} for chunk in chunks))
 
 
 if __name__ == "__main__":
