@@ -47,7 +47,7 @@ class AskTests(unittest.TestCase):
         self.assertEqual(chunks, [])
         self.assertEqual(answer_question("refund time?", chunks, DEFAULT_MODEL), NO_CONTEXT_MESSAGE)
 
-    def test_context_and_answer_include_sources(self) -> None:
+    def test_context_and_answer_include_sources_and_chunk_text(self) -> None:
         chunks = [
             RetrievedChunk(
                 text="Refunds are returned in 3-5 business days after approval.",
@@ -59,6 +59,10 @@ class AskTests(unittest.TestCase):
         self.assertIn("[refund_policy.md#chunk=3]", format_context(chunks))
         self.assertIn(
             "refund_policy.md#chunk=3",
+            format_answer("Refunds arrive in 3-5 business days.", chunks),
+        )
+        self.assertIn(
+            "Refunds are returned in 3-5 business days after approval.",
             format_answer("Refunds arrive in 3-5 business days.", chunks),
         )
 

@@ -196,14 +196,15 @@ def post_ollama_chat(ollama_url: str, payload: Mapping[str, Any]) -> Mapping[str
 
 
 def format_answer(answer: str, chunks: list[RetrievedChunk]) -> str:
-    """Append source labels to an answer."""
+    """Append source labels and chunk text to an answer."""
 
     if not chunks:
         return answer
 
-    sources = sorted({format_source(chunk.metadata) for chunk in chunks})
-    source_lines = "\n".join(f"- {source}" for source in sources)
-    return f"{answer}\n\n\u6765\u6e90\uff1a\n{source_lines}"
+    source_blocks = "\n\n".join(
+        f"- {format_source(chunk.metadata)}\n{chunk.text}" for chunk in chunks
+    )
+    return f"{answer}\n\n\u6765\u6e90\uff1a\n{source_blocks}"
 
 
 def main() -> int:
