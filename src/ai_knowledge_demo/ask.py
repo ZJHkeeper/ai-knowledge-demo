@@ -21,7 +21,30 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_TOP_K = 4
 DEFAULT_MIN_RECALL = 20
 DEFAULT_RECALL_MULTIPLIER = 5
+DEFAULT_QUERY_REWRITE_COUNT = 4
 NO_CONTEXT_MESSAGE = "\u77e5\u8bc6\u5e93\u4e2d\u6ca1\u6709\u627e\u5230\u76f8\u5173\u4fe1\u606f\u3002"
+CONCLUSION_LABEL = "\u7ed3\u8bba\uff1a"
+CONFIRMED_LABEL = "\u53ef\u4ee5\u786e\u8ba4\uff1a"
+UNCLEAR_LABEL = "\u672a\u660e\u786e\u8bf4\u660e\uff1a"
+RELATED_BUT_UNCLEAR_MESSAGE = (
+    "\u77e5\u8bc6\u5e93\u4e2d\u6709\u76f8\u5173\u4fe1\u606f\uff0c"
+    "\u4f46\u672a\u660e\u786e\u8bf4\u660e\u7528\u6237\u95ee\u9898\u7684\u5177\u4f53\u7b54\u6848\u3002"
+)
+RELATED_CONTEXT_FALLBACK = (
+    "\u77e5\u8bc6\u5e93\u5305\u542b\u4e0e\u95ee\u9898\u76f8\u5173\u7684\u5185\u5bb9\uff0c"
+    "\u8be6\u89c1\u4e0b\u65b9\u6765\u6e90\u3002"
+)
+LOW_SIGNAL_TERMS = {
+    "app",
+    "\u53ef\u4ee5",
+    "\u5546\u54c1",
+    "\u5904\u7406",
+    "\u600e\u4e48",
+    "\u663e\u793a",
+    "\u7528\u6237",
+    "\u95ee\u9898",
+    "\u8bf4\u660e",
+}
 HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+)$", re.MULTILINE)
 
 
@@ -54,6 +77,7 @@ def retrieve_chunks(
     persist_dir: Path,
     collection_name: str,
     top_k: int = DEFAULT_TOP_K,
+    search_queries: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Retrieve relevant chunks from a persistent Chroma collection."""
 
@@ -72,38 +96,66 @@ def retrieve_chunks(
         collection_count,
         max(top_k * DEFAULT_RECALL_MULTIPLIER, DEFAULT_MIN_RECALL),
     )
+    queries = search_queries or [question]
     result = collection.query(
-        query_texts=[question],
+        query_texts=queries,
         n_results=candidate_count,
         include=["documents", "metadatas", "distances"],
     )
-    candidates = chunks_from_query_result(result)
-    return rerank_chunks(question, candidates, top_k)
+    candidates = dedupe_chunks(chunks_from_query_result(result))
+    return rerank_chunks(question, candidates, top_k, scoring_queries=queries)
 
 
 def chunks_from_query_result(result: Mapping[str, Any]) -> list[RetrievedChunk]:
     """Convert Chroma's nested query response into a flat chunk list."""
 
-    documents = _first_result_list(result.get("documents"))
-    metadatas = _first_result_list(result.get("metadatas"))
-    distances = _first_result_list(result.get("distances"))
-
     chunks: list[RetrievedChunk] = []
-    for index, document in enumerate(documents):
-        if not document:
-            continue
+    document_groups = _result_groups(result.get("documents"))
+    metadata_groups = _result_groups(result.get("metadatas"))
+    distance_groups = _result_groups(result.get("distances"))
 
-        metadata = metadatas[index] if index < len(metadatas) and metadatas[index] else {}
-        distance = distances[index] if index < len(distances) else None
-        chunks.append(
-            RetrievedChunk(
-                text=str(document),
-                metadata=metadata,
-                distance=float(distance) if distance is not None else None,
+    for group_index, documents in enumerate(document_groups):
+        metadatas = metadata_groups[group_index] if group_index < len(metadata_groups) else []
+        distances = distance_groups[group_index] if group_index < len(distance_groups) else []
+        for index, document in enumerate(documents):
+            if not document:
+                continue
+
+            metadata = metadatas[index] if index < len(metadatas) and metadatas[index] else {}
+            distance = distances[index] if index < len(distances) else None
+            chunks.append(
+                RetrievedChunk(
+                    text=str(document),
+                    metadata=metadata,
+                    distance=float(distance) if distance is not None else None,
+                )
             )
-        )
 
     return chunks
+
+
+def dedupe_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """Deduplicate chunks from multiple retrieval queries, keeping best distance."""
+
+    by_key: dict[str, RetrievedChunk] = {}
+    order: list[str] = []
+    for chunk in chunks:
+        key = format_source(chunk.metadata)
+        if key == "unknown":
+            key = chunk.text
+
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = chunk
+            order.append(key)
+            continue
+
+        existing_distance = existing.distance if existing.distance is not None else float("inf")
+        chunk_distance = chunk.distance if chunk.distance is not None else float("inf")
+        if chunk_distance < existing_distance:
+            by_key[key] = chunk
+
+    return [by_key[key] for key in order]
 
 
 def format_context(chunks: list[RetrievedChunk]) -> str:
@@ -128,6 +180,7 @@ def rerank_chunks(
     question: str,
     chunks: list[RetrievedChunk],
     top_k: int,
+    scoring_queries: list[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Rerank vector candidates with lightweight keyword matching."""
 
@@ -136,9 +189,10 @@ def rerank_chunks(
     if not chunks:
         return []
 
+    queries = scoring_queries or [question]
     scored_chunks = [
         (
-            -keyword_score(question, chunk),
+            -sum(keyword_score(query, chunk) for query in queries),
             chunk.distance if chunk.distance is not None else float("inf"),
             index,
             chunk,
@@ -194,6 +248,7 @@ def extract_query_terms(question: str) -> list[str]:
                 for index in range(len(value) - size + 1):
                     terms.add(value[index : index + size])
 
+    terms = {term for term in terms if term not in LOW_SIGNAL_TERMS}
     return sorted(terms, key=lambda term: (-len(term), term))
 
 
@@ -213,7 +268,133 @@ def answer_question(
     answer = response.get("message", {}).get("content", "").strip()
     if not answer:
         raise RuntimeError("Ollama returned an empty answer.")
-    return answer
+    return normalize_answer_template(answer, question, chunks)
+
+
+def generate_search_queries(
+    question: str,
+    model: str,
+    ollama_url: str = DEFAULT_OLLAMA_URL,
+    rewrite_count: int = DEFAULT_QUERY_REWRITE_COUNT,
+) -> list[str]:
+    """Generate retrieval-focused query rewrites with Ollama."""
+
+    if rewrite_count <= 0:
+        return [question]
+
+    payload = build_query_rewrite_payload(question, model, rewrite_count)
+    try:
+        response = post_ollama_chat(ollama_url, payload)
+    except RuntimeError:
+        return [question]
+
+    content = response.get("message", {}).get("content", "")
+    rewrites = parse_search_queries(str(content), rewrite_count)
+    queries = [question, *rewrites]
+    return _unique_nonempty(queries)
+
+
+def build_query_rewrite_payload(
+    question: str,
+    model: str,
+    rewrite_count: int = DEFAULT_QUERY_REWRITE_COUNT,
+) -> dict[str, Any]:
+    """Build an Ollama request that rewrites the user question for retrieval."""
+
+    return {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "\u4f60\u662f RAG \u68c0\u7d22\u67e5\u8be2\u6539\u5199\u5668\u3002"
+                    "\u8bf7\u628a\u7528\u6237\u95ee\u9898\u6539\u5199\u6210\u66f4\u9002\u5408"
+                    "\u77e5\u8bc6\u5e93\u68c0\u7d22\u7684\u77ed\u67e5\u8be2\u3002"
+                    "\u8981\u4f7f\u7528\u591a\u79cd\u8868\u8fbe\uff0c\u8986\u76d6\u540c\u4e49\u8bf4\u6cd5\u3001"
+                    "\u4e1a\u52a1\u672f\u8bed\u3001\u4e0a\u4f4d\u7c7b\u76ee\u548c\u53ef\u80fd\u7684\u5904\u7406\u65b9\u5f0f\u3002"
+                    "\u4e0d\u8981\u53ea\u6539\u5199\u5b57\u9762\u8868\u8fbe\uff0c"
+                    "\u8981\u628a\u7528\u6237\u7684\u53e3\u8bed\u573a\u666f\u8f6c\u6210\u77e5\u8bc6\u5e93\u53ef\u80fd\u4f7f\u7528\u7684\u653f\u7b56\u8bcd\u3002"
+                    "\u4f8b\u5982\uff1a\u201cApp \u663e\u793a\u5df2\u9001\u8fbe\u4f46\u6ca1\u6536\u5230\u5546\u54c1\u201d"
+                    "\u5e94\u6269\u5c55\u4e3a\u7269\u6d41\u5f02\u5e38\u3001\u8fd0\u8f93\u4e22\u5931\u3001"
+                    "\u672a\u6536\u8d27\u3001\u5ba2\u670d\u3001\u8865\u53d1\u3001\u5168\u989d\u9000\u6b3e\u7b49\u68c0\u7d22\u8bcd\u3002"
+                    "\u4f8b\u5982\uff1a\u201c\u4e2a\u4eba\u53d1\u7968\u80fd\u5426\u5f00\u5177\u201d"
+                    "\u5e94\u6269\u5c55\u4e3a\u53d1\u7968\u3001\u7535\u5b50\u53d1\u7968\u3001"
+                    "\u589e\u503c\u7a0e\u4e13\u7528\u53d1\u7968\u3001\u4e2a\u4eba\u7528\u6237\u3001\u4f01\u4e1a\u7528\u6237\u7b49\u68c0\u7d22\u8bcd\u3002"
+                    "\u53ea\u8f93\u51fa JSON \u6570\u7ec4\uff0c\u6570\u7ec4\u5143\u7d20\u662f\u5b57\u7b26\u4e32\uff0c"
+                    "\u4e0d\u8981\u8f93\u51fa\u5176\u4ed6\u5185\u5bb9\u3002"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"\u8bf7\u751f\u6210 {rewrite_count} \u6761\u68c0\u7d22\u67e5\u8be2\u6539\u5199\uff1a"
+                    f"{question}"
+                ),
+            },
+        ],
+    }
+
+
+def parse_search_queries(content: str, limit: int) -> list[str]:
+    """Parse query rewrites from JSON or line-oriented model output."""
+
+    candidates: list[str] = []
+    json_text = _extract_json_array(content)
+    if json_text is not None:
+        try:
+            parsed = json.loads(json_text)
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            candidates.extend(str(item) for item in parsed)
+
+    if not candidates:
+        for line in content.splitlines():
+            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if cleaned:
+                candidates.append(cleaned.strip("\"'"))
+
+    return _unique_nonempty(candidates)[:limit]
+
+
+def normalize_answer_template(
+    answer: str,
+    question: str,
+    chunks: list[RetrievedChunk],
+) -> str:
+    """Keep local-model answers inside the fixed answerability template."""
+
+    normalized = answer.strip()
+    if not normalized:
+        return normalized
+
+    has_related_context = any(keyword_score(question, chunk) > 0 for chunk in chunks)
+    if has_related_context and normalized.startswith(f"{CONCLUSION_LABEL}{NO_CONTEXT_MESSAGE}"):
+        normalized = normalized.replace(
+            f"{CONCLUSION_LABEL}{NO_CONTEXT_MESSAGE}",
+            f"{CONCLUSION_LABEL}{RELATED_BUT_UNCLEAR_MESSAGE}",
+            1,
+        )
+
+    if CONCLUSION_LABEL not in normalized:
+        normalized = f"{CONCLUSION_LABEL}{RELATED_BUT_UNCLEAR_MESSAGE}\n{normalized}"
+
+    if CONFIRMED_LABEL not in normalized:
+        confirmed = RELATED_CONTEXT_FALLBACK if has_related_context else "\u65e0"
+        normalized = f"{normalized}\n{CONFIRMED_LABEL}\n- {confirmed}"
+    elif has_related_context:
+        normalized = _replace_empty_section(
+            normalized,
+            CONFIRMED_LABEL,
+            UNCLEAR_LABEL,
+            RELATED_CONTEXT_FALLBACK,
+        )
+
+    if UNCLEAR_LABEL not in normalized:
+        normalized = f"{normalized}\n{UNCLEAR_LABEL}\n- \u65e0"
+
+    return normalized
 
 
 def build_ollama_payload(
@@ -233,10 +414,45 @@ def build_ollama_payload(
                 "content": (
                     "\u4f60\u662f\u4e00\u4e2a\u4e25\u8c28\u7684\u4e2d\u6587\u77e5\u8bc6\u5e93"
                     "\u95ee\u7b54\u52a9\u624b\u3002\u53ea\u80fd\u6839\u636e\u63d0\u4f9b"
-                    "\u7684\u77e5\u8bc6\u5e93\u4e0a\u4e0b\u6587\u56de\u7b54\uff1b"
-                    f"\u5982\u679c\u4e0a\u4e0b\u6587\u6ca1\u6709\u4f9d\u636e\uff0c"
-                    f"\u56de\u7b54\u201c{NO_CONTEXT_MESSAGE}\u201d\u3002"
-                    "\u56de\u7b54\u8981\u7b80\u6d01\u3002"
+                    "\u7684\u77e5\u8bc6\u5e93\u4e0a\u4e0b\u6587\u56de\u7b54\u3002"
+                    "\u5148\u5224\u65ad\u95ee\u9898\u7684 answerability\uff0c"
+                    "\u53ea\u80fd\u662f\u4ee5\u4e0b\u4e09\u6863\u4e4b\u4e00\uff1a"
+                    "\u53ef\u76f4\u63a5\u56de\u7b54\uff1a\u4e0a\u4e0b\u6587\u660e\u786e\u56de\u7b54\u7528\u6237\u95ee\u9898\u3002"
+                    "\u90e8\u5206\u76f8\u5173\u4f46\u672a\u660e\u786e\uff1a"
+                    "\u4e0a\u4e0b\u6587\u4e0e\u95ee\u9898\u76f8\u5173\uff0c"
+                    "\u4f46\u6ca1\u6709\u8986\u76d6\u7528\u6237\u8ffd\u95ee\u7684\u5177\u4f53\u70b9\u3002"
+                    "\u5b8c\u5168\u65e0\u5173\uff1a\u4e0a\u4e0b\u6587\u548c\u95ee\u9898\u65e0\u5173\u3002"
+                    "\u5982\u679c\u4e0a\u4e0b\u6587\u548c\u95ee\u9898\u5171\u4eab\u540c\u4e00\u4e1a\u52a1\u4e3b\u9898"
+                    "\uff08\u4f8b\u5982\u90fd\u5728\u8bf4\u53d1\u7968\u3001\u9000\u6b3e\u3001\u7269\u6d41\u7b49\uff09\uff0c"
+                    "\u5373\u4f7f\u6ca1\u6709\u76f4\u63a5\u7ed3\u8bba\uff0c"
+                    "\u4e5f\u5fc5\u987b\u5224\u4e3a\u201c\u90e8\u5206\u76f8\u5173\u4f46\u672a\u660e\u786e\u201d\uff0c"
+                    "\u4e0d\u80fd\u5224\u4e3a\u201c\u5b8c\u5168\u65e0\u5173\u201d\u3002"
+                    "\u53ea\u8981\u4f60\u80fd\u4ece\u4e0a\u4e0b\u6587\u5217\u51fa\u4efb\u4f55\u4e00\u6761"
+                    "\u4e0e\u95ee\u9898\u76f8\u5173\u7684\u53ef\u786e\u8ba4\u4e8b\u5b9e\uff0c"
+                    f"\u7ed3\u8bba\u5c31\u4e0d\u80fd\u4f7f\u7528\u201c{NO_CONTEXT_MESSAGE}\u201d\u3002"
+                    "\u5fc5\u987b\u4e14\u53ea\u80fd\u4f7f\u7528\u4e0b\u9762\u7684\u56fa\u5b9a\u8f93\u51fa\u683c\u5f0f\uff0c"
+                    "\u4e0d\u8981\u8f93\u51fa\u6a21\u677f\u5916\u7684\u5176\u4ed6\u6bb5\u843d\u3002"
+                    "\u5373\u4f7f\u67d0\u4e2a\u5b57\u6bb5\u5185\u5bb9\u4e3a\u201c\u65e0\u201d\uff0c"
+                    "\u4e5f\u5fc5\u987b\u4fdd\u7559\u8be5\u5b57\u6bb5\u6807\u9898\u3002"
+                    "\u56fa\u5b9a\u8f93\u51fa\u683c\u5f0f\uff1a"
+                    "\u7ed3\u8bba\uff1a...\n"
+                    "\u53ef\u4ee5\u786e\u8ba4\uff1a\n"
+                    "- ...\n"
+                    "\u672a\u660e\u786e\u8bf4\u660e\uff1a\n"
+                    "- ...\n"
+                    "\u5bf9\u4e8e\u201c\u53ef\u76f4\u63a5\u56de\u7b54\u201d\uff0c"
+                    "\u7ed3\u8bba\u76f4\u63a5\u56de\u7b54\uff1b\u53ef\u4ee5\u786e\u8ba4\u5217\u51fa 1-3 \u6761\u4f9d\u636e\uff1b"
+                    "\u672a\u660e\u786e\u8bf4\u660e\u5199\u201c\u65e0\u201d\u3002"
+                    "\u5bf9\u4e8e\u201c\u90e8\u5206\u76f8\u5173\u4f46\u672a\u660e\u786e\u201d\uff0c"
+                    "\u7ed3\u8bba\u8bf4\u660e\u77e5\u8bc6\u5e93\u4e2d\u6709\u76f8\u5173\u4fe1\u606f\uff0c"
+                    "\u4f46\u672a\u660e\u786e\u8bf4\u660e\u7528\u6237\u8ffd\u95ee\u7684\u5177\u4f53\u70b9\uff1b"
+                    "\u53ef\u4ee5\u786e\u8ba4\u5217\u51fa 1-3 \u6761\u76f8\u5173\u4e8b\u5b9e\uff1b"
+                    "\u672a\u660e\u786e\u8bf4\u660e\u5217\u51fa 1-3 \u6761\u7f3a\u53e3\u3002"
+                    "\u5bf9\u4e8e\u201c\u5b8c\u5168\u65e0\u5173\u201d\uff0c"
+                    f"\u7ed3\u8bba\u5fc5\u987b\u662f\u201c{NO_CONTEXT_MESSAGE}\u201d\uff1b"
+                    "\u53ef\u4ee5\u786e\u8ba4\u5199\u201c\u65e0\u201d\uff1b"
+                    "\u672a\u660e\u786e\u8bf4\u660e\u5199\u201c\u7528\u6237\u95ee\u9898\u76f8\u5173\u5185\u5bb9\u672a\u5728\u77e5\u8bc6\u5e93\u4e2d\u51fa\u73b0\u201d\u3002"
+                    "\u56de\u7b54\u8981\u7b80\u6d01\uff0c\u4e0d\u8981\u7f16\u9020\u77e5\u8bc6\u5e93\u4e2d\u6ca1\u6709\u7684\u7ed3\u8bba\u3002"
                 ),
             },
             {
@@ -244,7 +460,8 @@ def build_ollama_payload(
                 "content": (
                     f"\u95ee\u9898\uff1a{question}\n\n"
                     f"\u77e5\u8bc6\u5e93\u4e0a\u4e0b\u6587\uff1a\n{context}\n\n"
-                    "\u8bf7\u56de\u7b54\u95ee\u9898\u3002"
+                    "\u8bf7\u4e25\u683c\u6309\u7cfb\u7edf\u6d88\u606f\u4e2d\u7684"
+                    "\u56fa\u5b9a\u6a21\u677f\u56de\u7b54\uff0c\u4e0d\u8981\u8f93\u51fa\u6a21\u677f\u5916\u5185\u5bb9\u3002"
                 ),
             },
         ],
@@ -281,13 +498,37 @@ def post_ollama_chat(ollama_url: str, payload: Mapping[str, Any]) -> Mapping[str
 def format_answer(answer: str, chunks: list[RetrievedChunk]) -> str:
     """Append source labels and chunk text to an answer."""
 
+    return format_answer_with_queries(answer, chunks)
+
+
+def format_answer_with_queries(
+    answer: str,
+    chunks: list[RetrievedChunk],
+    search_queries: list[str] | None = None,
+) -> str:
+    """Format query rewrites, answer, and source chunks for CLI output."""
+
+    output_parts: list[str] = []
+    if search_queries:
+        output_parts.append(format_search_queries(search_queries))
+
+    output_parts.append(answer)
+
     if not chunks:
-        return answer
+        return "\n\n".join(output_parts)
 
     source_blocks = "\n\n".join(
         f"- {format_source(chunk.metadata)}\n{chunk.text}" for chunk in chunks
     )
-    return f"{answer}\n\n\u6765\u6e90\uff1a\n{source_blocks}"
+    output_parts.append(f"\u6765\u6e90\uff1a\n{source_blocks}")
+    return "\n\n".join(output_parts)
+
+
+def format_search_queries(search_queries: list[str]) -> str:
+    """Format retrieval queries for debugging the retrieval step."""
+
+    query_lines = "\n".join(f"- {query}" for query in search_queries)
+    return f"\u68c0\u7d22\u67e5\u8be2\uff1a\n{query_lines}"
 
 
 def main() -> int:
@@ -296,18 +537,24 @@ def main() -> int:
     args = parse_args()
 
     try:
+        search_queries = generate_search_queries(
+            args.question,
+            args.model,
+            args.ollama_url,
+        )
         chunks = retrieve_chunks(
             question=args.question,
             persist_dir=args.persist_dir.resolve(),
             collection_name=args.collection,
             top_k=args.top_k,
+            search_queries=search_queries,
         )
         answer = answer_question(args.question, chunks, args.model, args.ollama_url)
     except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    print(format_answer(answer, chunks))
+    print(format_answer_with_queries(answer, chunks, search_queries))
     return 0
 
 
@@ -321,6 +568,16 @@ def _first_result_list(value: Any) -> list[Any]:
     return []
 
 
+def _result_groups(value: Any) -> list[list[Any]]:
+    if not value:
+        return []
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        return value
+    if isinstance(value, list):
+        return [value]
+    return []
+
+
 def _first_heading(text: str) -> str:
     match = HEADING_RE.search(text)
     if match is None:
@@ -330,6 +587,49 @@ def _first_heading(text: str) -> str:
 
 def _compact_text(text: str) -> str:
     return re.sub(r"\s+", "", text).lower()
+
+
+def _replace_empty_section(
+    text: str,
+    label: str,
+    next_label: str,
+    replacement: str,
+) -> str:
+    start = text.find(label)
+    if start == -1:
+        return text
+
+    content_start = start + len(label)
+    end = text.find(next_label, content_start)
+    if end == -1:
+        end = len(text)
+
+    section_content = text[content_start:end].strip()
+    compact_content = _compact_text(section_content)
+    if compact_content not in {"", "-\u65e0", "\u65e0", "\u65e0\u3002"}:
+        return text
+
+    return f"{text[:content_start]}\n- {replacement}\n{text[end:]}"
+
+
+def _extract_json_array(text: str) -> str | None:
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1]
+
+
+def _unique_nonempty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique_values: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_values.append(normalized)
+    return unique_values
 
 
 if __name__ == "__main__":
