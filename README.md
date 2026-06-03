@@ -2,6 +2,62 @@
 
 一个最小 RAG 示例项目：把 `data/` 里的 Markdown 文档写入本地 Chroma 向量库，然后从 Chroma 检索上下文并调用本地 Ollama 模型回答问题。
 
+## 技术栈
+
+- Python 3.13+：项目主语言，使用标准库 `argparse`、`pathlib`、`urllib`、`unittest` 等实现 CLI、文件读取、HTTP 调用和测试。
+- ChromaDB：本地向量数据库，使用 `chromadb.PersistentClient` 将知识库 chunk 持久化到 `chroma_db/`。
+- Chroma 默认 embedding：入库和检索时使用 Chroma collection 的默认 embedding 能力，首次运行可能会下载默认本地 embedding 模型。
+- Ollama：本地大语言模型服务，问答阶段通过 `/api/chat` 调用，默认模型为 `qwen2.5:7b`。
+- setuptools：通过 `pyproject.toml` 管理包构建、可编辑安装和命令行入口。
+- unittest：项目测试框架，测试文件位于 `tests/`。
+
+当前项目没有引入 LangChain，RAG 流程由项目代码直接串联 ChromaDB 和 Ollama。
+
+## 项目架构
+
+```text
+ai-knowledge-demo/
+├── data/                         # Markdown 知识库文档
+│   └── refund_policy.md
+├── chroma_db/                    # Chroma 本地持久化数据目录，入库后生成
+├── src/
+│   └── ai_knowledge_demo/
+│       ├── cli.py                # 基础命令入口：ai-knowledge-demo
+│       ├── ingest.py             # 文档发现、读取、切分、写入 Chroma
+│       └── ask.py                # 检索、重排、调用 Ollama、格式化回答
+├── tests/                        # 单元测试
+├── pyproject.toml                # 项目元数据、依赖和命令行入口
+└── README.md
+```
+
+核心流程分为两条命令链路：
+
+```text
+入库链路：
+data/*.md
+  -> discover_markdown_files()
+  -> read_markdown_file()
+  -> chunk_markdown()
+  -> ingest_chunks()
+  -> chroma_db/
+
+问答链路：
+用户问题
+  -> generate_search_queries()
+  -> retrieve_chunks()
+  -> rerank_chunks()
+  -> answer_question()
+  -> Ollama /api/chat
+  -> 带来源的中文回答
+```
+
+模块职责：
+
+- `ai_knowledge_demo.ingest`：负责知识库构建。它递归发现 Markdown 文件，兼容 UTF-8 和 GB18030 编码读取内容，按标题、分隔线和长度切分 chunk，并写入 Chroma collection。
+- `ai_knowledge_demo.ask`：负责 RAG 问答。它先让 Ollama 生成检索改写，再从 Chroma 扩大召回候选 chunk，通过关键词规则重排，最后把带来源标签的上下文提交给 Ollama 生成回答。
+- `ai_knowledge_demo.cli`：基础 CLI 健康检查入口，安装后可通过 `ai-knowledge-demo` 调用。
+- `tests/`：覆盖入库切分、CLI 和问答辅助逻辑，便于调整 chunk、检索和输出格式时做回归验证。
+
 ## Setup
 
 创建虚拟环境：
