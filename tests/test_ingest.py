@@ -15,8 +15,13 @@ from ai_knowledge_demo.ingest import (
 
 
 def write_simple_pdf(path: Path, text: str) -> None:
-    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    content = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET"
+    lines = text.splitlines() or [text]
+    escaped_lines = [
+        line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        for line in lines
+    ]
+    text_ops = " T* ".join(f"({line}) Tj" for line in escaped_lines)
+    content = f"BT /F1 12 Tf 72 720 Td 14 TL {text_ops} ET"
     content_bytes = content.encode("ascii")
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -77,6 +82,36 @@ class IngestChunkTests(unittest.TestCase):
             self.assertEqual(read_document_file(markdown_file), "# Title\n\nUTF-8 text")
             self.assertEqual(read_document_file(text_file), "中文文本")
 
+    def test_txt_numbered_sections_become_separate_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            text_file = Path(temp_dir) / "rules.txt"
+            text_file.write_text(
+                "\n".join(
+                    [
+                        "物流异常与签收争议处理规则",
+                        "",
+                        "一、物流状态异常",
+                        "超过 7 天没有更新可申请催单。",
+                        "",
+                        "二、签收争议处理结果",
+                        "核实运输丢失后可补发或退款。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            text = read_document_file(text_file)
+            chunks = chunk_markdown(text, text_file.name)
+
+        self.assertEqual(
+            [chunk.text for chunk in chunks],
+            [
+                "物流异常与签收争议处理规则",
+                "## 一、物流状态异常\n超过 7 天没有更新可申请催单。",
+                "## 二、签收争议处理结果\n核实运输丢失后可补发或退款。",
+            ],
+        )
+
     def test_reads_docx_paragraphs_and_tables(self) -> None:
         from docx import Document
 
@@ -94,6 +129,31 @@ class IngestChunkTests(unittest.TestCase):
         self.assertIn("Membership invoice paragraph.", text)
         self.assertIn("Invoice type\tElectronic", text)
 
+    def test_docx_numbered_sections_become_separate_chunks(self) -> None:
+        from docx import Document
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            docx_file = Path(temp_dir) / "manual.docx"
+            document = Document()
+            document.add_paragraph("会员与发票处理补充规则")
+            document.add_paragraph("一、会员自动续费")
+            document.add_paragraph("自动续费后 24 小时内未使用权益可申请退款。")
+            document.add_paragraph("二、电子发票")
+            document.add_paragraph("订单退款后，对应电子发票会自动作废。")
+            document.save(docx_file)
+
+            text = read_document_file(docx_file)
+            chunks = chunk_markdown(text, docx_file.name)
+
+        self.assertEqual(
+            [chunk.text for chunk in chunks],
+            [
+                "会员与发票处理补充规则",
+                "## 一、会员自动续费\n自动续费后 24 小时内未使用权益可申请退款。",
+                "## 二、电子发票\n订单退款后，对应电子发票会自动作废。",
+            ],
+        )
+
     def test_reads_pdf_text(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             pdf_file = Path(temp_dir) / "manual.pdf"
@@ -102,6 +162,38 @@ class IngestChunkTests(unittest.TestCase):
             text = read_document_file(pdf_file)
 
         self.assertIn("International payment refund manual.", text)
+
+    def test_pdf_numbered_sections_become_separate_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_file = Path(temp_dir) / "manual.pdf"
+            write_simple_pdf(
+                pdf_file,
+                "\n".join(
+                    [
+                        "page 1",
+                        "International payment refund manual",
+                        "1. Refund timing",
+                        "Refunds usually arrive in 7-15 business days.",
+                        "2. Manual review",
+                        "High-risk international orders need manual review.",
+                    ]
+                ),
+            )
+
+            text = read_document_file(pdf_file)
+            chunks = chunk_markdown(text, "manual.pdf")
+
+        self.assertNotIn("page 1", text)
+        self.assertIn("## 1. Refund timing", text)
+        self.assertIn("## 2. Manual review", text)
+        self.assertEqual(
+            [chunk.text for chunk in chunks],
+            [
+                "International payment refund manual",
+                "## 1. Refund timing\nRefunds usually arrive in 7-15 business days.",
+                "## 2. Manual review\nHigh-risk international orders need manual review.",
+            ],
+        )
 
     def test_short_markdown_stays_in_one_chunk(self) -> None:
         text = "# Refunds\n\nRefund requests must be filed within 7 days."

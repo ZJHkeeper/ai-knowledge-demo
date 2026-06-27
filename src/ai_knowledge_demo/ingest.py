@@ -19,6 +19,9 @@ SUPPORTED_DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".pdf", ".docx"})
 TEXT_DOCUMENT_SUFFIXES = frozenset({".md", ".txt"})
 HEADING_RE = re.compile(r"^[ \t]*#{1,6}\s+.+$")
 THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,}|(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$")
+PDF_PAGE_LABEL_RE = re.compile(r"^[ \t]*(?:page[ \t]+\d+|第[ \t]*\d+[ \t]*页)[ \t]*$", re.IGNORECASE)
+CJK_SECTION_HEADING_RE = re.compile(r"^[ \t]*[一二三四五六七八九十百千]+[、.．][ \t]*\S+")
+NUMBERED_SECTION_HEADING_RE = re.compile(r"^[ \t]*\d+(?:\.\d+)*[.)、][ \t]*\S+")
 
 
 @dataclass(frozen=True)
@@ -59,12 +62,14 @@ def read_document_file(path: Path) -> str:
     """Read a supported document file as plain text."""
 
     suffix = path.suffix.lower()
-    if suffix in TEXT_DOCUMENT_SUFFIXES:
+    if suffix == ".md":
         return read_text_document_file(path)
+    if suffix == ".txt":
+        return _normalize_extracted_text(read_text_document_file(path))
     if suffix == ".pdf":
         return _read_pdf_file(path)
     if suffix == ".docx":
-        return _read_docx_file(path)
+        return _normalize_extracted_text(_read_docx_file(path))
     raise ValueError(f"unsupported document type: {path}")
 
 
@@ -237,8 +242,31 @@ def _read_pdf_file(path: Path) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(path)
-    page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
-    return "\n\n".join(page_texts).strip()
+    page_texts = []
+    for page in reader.pages:
+        page_text = _normalize_extracted_text(page.extract_text() or "")
+        if page_text:
+            page_texts.append(page_text)
+    return "\n\n---\n\n".join(page_texts).strip()
+
+
+def _normalize_extracted_text(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or PDF_PAGE_LABEL_RE.match(line):
+            continue
+        if _looks_like_extracted_heading(line) and not HEADING_RE.match(line):
+            line = f"## {line}"
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _looks_like_extracted_heading(line: str) -> bool:
+    return bool(
+        CJK_SECTION_HEADING_RE.match(line)
+        or NUMBERED_SECTION_HEADING_RE.match(line)
+    )
 
 
 def _read_docx_file(path: Path) -> str:
