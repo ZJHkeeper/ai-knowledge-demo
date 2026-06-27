@@ -328,6 +328,25 @@ OK
 ...
 ```
 
+### 新增 eval 数据集与评估脚本
+
+- 问题：现有单元测试能覆盖切分、检索重排、输出格式等局部逻辑，但缺少一组面向真实用户问题的端到端评估数据。每次调整 query rewrite、BM25、重排或回答策略后，只靠手工提问不容易稳定判断整体效果是否退化。
+- 解决过程：新增 `tests/eval_cases.json` 作为 eval 数据集，按业务场景记录问题、类型说明、可接受来源、回答必须包含内容、建议包含内容和是否预期拒答。新增包内评估入口 `ai_knowledge_demo.evaluate`，批量读取 eval case，复用现有问答链路执行 query rewrite、混合检索和重排，并按 case 语义校验检索来源与回答内容。
+- 结论：eval 应默认模拟真实用户提问流程，而不是只做原始问题直检。因此即使使用 `--retrieval-only`，默认仍会执行 query rewrite，只跳过最终回答生成；如需定位 query rewrite 的贡献，可显式传入 `--no-query-rewrite` 做消融对照。
+- 优化方案：新增安装入口 `ai-knowledge-evaluate`；评估脚本支持 `--cases`、`--top-k`、`--persist-dir`、`--collection`、`--bm25-index`、`--no-bm25`、`--model`、`--ollama-url`、`--retrieval-only` 和 `--no-query-rewrite`。`expected_sources` 表示可接受来源集合，命中任意一个即通过；`must_include` 为硬性答案断言；`should_include` 只输出 warning，不影响通过率；`expected_refusal` 用于区分应拒答和不应拒答场景。
+- 验证结果：默认 retrieval-only eval 会经过 query rewrite，10 条 eval case 全部通过；关闭 query rewrite 后，`EVAL-002`（“钱什么时候能退回来？”）无法稳定命中 `refund_policy.md#chunk=2`，说明该 case 有效覆盖了语义表达不一致时 query rewrite 的价值。
+```text
+> .\.venv\Scripts\python -m unittest discover
+Ran 48 tests
+OK
+
+> .\.venv\Scripts\python -m ai_knowledge_demo.evaluate --retrieval-only
+Summary: 10/10 passed (100.0%).
+
+> .\.venv\Scripts\python -m ai_knowledge_demo.evaluate --retrieval-only --no-query-rewrite
+Summary: 9/10 passed (90.0%).
+```
+
 ## Setup
 
 创建虚拟环境：

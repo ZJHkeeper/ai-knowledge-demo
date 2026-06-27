@@ -1,0 +1,118 @@
+[
+  {
+    "id": "EVAL-001",
+    "type": "basic_fact",
+    "type_description": "基础事实问答：测试系统能否根据知识库回答明确存在的事实信息",
+    "question": "退款多久到账？",
+    "expected_sources": ["refund_policy.md"],
+    "must_include": ["3-5 个工作日", "原路返回"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-002",
+    "type": "semantic_retrieval",
+    "type_description": "语义检索：测试用户表达和文档原文不完全一致时，系统能否通过语义找到正确内容",
+    "question": "钱什么时候能退回来？",
+    "expected_sources": ["refund_policy.md"],
+    "must_include": ["3-5 个工作日"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-003",
+    "type": "payment_channel",
+    "type_description": "支付渠道规则：测试不同支付方式或退款渠道下的特殊到账规则",
+    "question": "国际信用卡退款一般需要多久？",
+    "expected_sources": [
+      "international_payment_refund_manual.pdf",
+      "customer_service_manual.md",
+      "refund_policy.md"
+    ],
+    "must_include": ["7-15 个工作日"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-004",
+    "type": "logistics_exception",
+    "type_description": "物流异常处理：测试签收异常、未收到货、丢件等售后物流场景",
+    "question": "物流显示已送达，但我没有收到商品怎么办？",
+    "expected_sources": [
+      "logistics_exception_rules.txt",
+      "customer_service_manual.md",
+      "refund_policy.md"
+    ],
+    "must_include": ["联系客服", "补发", "退款"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-005",
+    "type": "membership_refund",
+    "type_description": "会员退款规则：测试会员开通、自动续费、权益使用后的退款判断",
+    "question": "会员自动续费后可以退款吗？",
+    "expected_sources": [
+      "payment_and_membership_rules.md",
+      "membership_invoice_rules.docx",
+      "customer_service_manual.md"
+    ],
+    "must_include": ["24 小时", "未使用会员权益"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-006",
+    "type": "coupon_refund",
+    "type_description": "优惠券退款规则：测试订单退款后优惠券是否返还、是否参与退款等问题",
+    "question": "订单退款后优惠券会返还吗？",
+    "expected_sources": [
+      "refund_policy.md",
+      "customer_service_manual.md"
+    ],
+    "must_include": ["优惠券", "无法返还"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-007",
+    "type": "exact_entity",
+    "type_description": "精确实体检索：测试 Apple Pay、Visa、订单号、型号等精确词是否能被正确召回",
+    "question": "Apple Pay 支持海外地区吗？",
+    "expected_sources": [
+      "payment_and_membership_rules.md",
+      "refund_policy.md"
+    ],
+    "must_include": ["Apple Pay", "海外", "地区限制"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-008",
+    "type": "invoice",
+    "type_description": "发票规则：测试退款、开票、发票作废、专票等发票相关知识",
+    "question": "订单退款后发票还有效吗？",
+    "expected_sources": [
+      "refund_policy.md",
+      "customer_service_manual.md",
+      "membership_invoice_rules.docx"
+    ],
+    "must_include": ["发票", "作废", "失效"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-009",
+    "type": "partial_answerability",
+    "type_description": "部分可回答：测试知识库存在相关信息但没有明确答案时，系统能否说明已知内容和未明确部分",
+    "question": "我可以开具个人发票吗？",
+    "expected_sources": [
+      "refund_policy.md",
+      "membership_invoice_rules.docx"
+    ],
+    "must_include": ["发票"],
+    "should_include": ["未明确说明", "个人发票"],
+    "expected_refusal": false
+  },
+  {
+    "id": "EVAL-010",
+    "type": "refusal",
+    "type_description": "拒答测试：测试知识库没有相关信息时，系统是否能拒绝编造答案",
+    "question": "平台支持比特币退款提现吗？",
+    "expected_sources": [],
+    "must_include": ["没有找到相关信息"],
+    "expected_refusal": true
+  }
+]
