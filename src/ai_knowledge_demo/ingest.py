@@ -1,4 +1,4 @@
-"""Ingest Markdown files from ./data into a persistent Chroma collection."""
+"""Ingest supported documents from ./data into a persistent Chroma collection."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ DEFAULT_PERSIST_DIR = PROJECT_ROOT / "chroma_db"
 DEFAULT_COLLECTION = "ai_knowledge_demo"
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
+SUPPORTED_DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".pdf", ".docx"})
+TEXT_DOCUMENT_SUFFIXES = frozenset({".md", ".txt"})
 HEADING_RE = re.compile(r"^[ \t]*#{1,6}\s+.+$")
 THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,}|(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$")
 
@@ -27,8 +29,8 @@ class Chunk:
     metadata: dict[str, int | str]
 
 
-def read_markdown_file(path: Path) -> str:
-    """Read Markdown text with common UTF encodings and GB18030 fallback."""
+def read_text_document_file(path: Path) -> str:
+    """Read plain text documents with common UTF encodings and GB18030 fallback."""
 
     errors: list[str] = []
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
@@ -39,7 +41,7 @@ def read_markdown_file(path: Path) -> str:
 
     joined_errors = "; ".join(errors)
     raise UnicodeDecodeError(
-        "markdown",
+        "document",
         b"\x00",
         0,
         1,
@@ -47,12 +49,44 @@ def read_markdown_file(path: Path) -> str:
     )
 
 
-def discover_markdown_files(data_dir: Path) -> list[Path]:
-    """Find Markdown files in a deterministic order."""
+def read_markdown_file(path: Path) -> str:
+    """Read Markdown text with common UTF encodings and GB18030 fallback."""
+
+    return read_text_document_file(path)
+
+
+def read_document_file(path: Path) -> str:
+    """Read a supported document file as plain text."""
+
+    suffix = path.suffix.lower()
+    if suffix in TEXT_DOCUMENT_SUFFIXES:
+        return read_text_document_file(path)
+    if suffix == ".pdf":
+        return _read_pdf_file(path)
+    if suffix == ".docx":
+        return _read_docx_file(path)
+    raise ValueError(f"unsupported document type: {path}")
+
+
+def discover_document_files(data_dir: Path) -> list[Path]:
+    """Find supported document files in a deterministic order."""
 
     if not data_dir.exists():
         return []
-    return sorted(data_dir.rglob("*.md"), key=lambda path: path.as_posix().lower())
+    return sorted(
+        (
+            path
+            for path in data_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
+        ),
+        key=lambda path: path.as_posix().lower(),
+    )
+
+
+def discover_markdown_files(data_dir: Path) -> list[Path]:
+    """Find supported document files in a deterministic order."""
+
+    return discover_document_files(data_dir)
 
 
 def chunk_markdown(
@@ -84,7 +118,7 @@ def chunk_markdown(
 
 
 def build_chunks_for_files(
-    markdown_files: Iterable[Path],
+    document_files: Iterable[Path],
     data_dir: Path,
     chunk_size: int,
     chunk_overlap: int,
@@ -95,12 +129,12 @@ def build_chunks_for_files(
     files_read = 0
     errors: list[str] = []
 
-    for markdown_file in markdown_files:
-        source = markdown_file.relative_to(data_dir).as_posix()
+    for document_file in document_files:
+        source = document_file.relative_to(data_dir).as_posix()
         try:
-            text = read_markdown_file(markdown_file)
-        except UnicodeDecodeError as exc:
-            errors.append(str(exc))
+            text = read_document_file(document_file)
+        except Exception as exc:
+            errors.append(f"{document_file}: {exc}")
             continue
 
         file_chunks = chunk_markdown(text, source, chunk_size, chunk_overlap)
@@ -137,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser(
-        description="Ingest Markdown files from ./data into a Chroma vector database."
+        description="Ingest supported documents from ./data into a Chroma vector database."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--persist-dir", type=Path, default=DEFAULT_PERSIST_DIR)
@@ -148,15 +182,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """Run Markdown ingestion."""
+    """Run document ingestion."""
 
     args = parse_args()
     data_dir = args.data_dir.resolve()
     persist_dir = args.persist_dir.resolve()
 
-    markdown_files = discover_markdown_files(data_dir)
+    document_files = discover_document_files(data_dir)
     chunks, files_read, errors = build_chunks_for_files(
-        markdown_files,
+        document_files,
         data_dir,
         args.chunk_size,
         args.chunk_overlap,
@@ -197,6 +231,42 @@ def _markdown_spans(text: str) -> list[tuple[int, int]]:
     if trimmed is not None:
         spans.append(trimmed)
     return spans
+
+
+def _read_pdf_file(path: Path) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
+    return "\n\n".join(page_texts).strip()
+
+
+def _read_docx_file(path: Path) -> str:
+    from docx import Document
+
+    document = Document(path)
+    blocks: list[str] = []
+    blocks.extend(
+        paragraph.text.strip()
+        for paragraph in document.paragraphs
+        if paragraph.text.strip()
+    )
+
+    for table in document.tables:
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                cell_text = "\n".join(
+                    paragraph.text.strip()
+                    for paragraph in cell.paragraphs
+                    if paragraph.text.strip()
+                )
+                if cell_text:
+                    cells.append(cell_text)
+            if cells:
+                blocks.append("\t".join(cells))
+
+    return "\n\n".join(blocks).strip()
 
 
 def _split_span(
