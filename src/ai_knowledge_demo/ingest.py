@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "chroma_db"
 DEFAULT_COLLECTION = "ai_knowledge_demo"
+DEFAULT_BM25_INDEX_NAME = "bm25_index.json"
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
 SUPPORTED_DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".pdf", ".docx"})
 TEXT_DOCUMENT_SUFFIXES = frozenset({".md", ".txt"})
+ALNUM_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+CJK_TEXT_RE = re.compile(r"[\u4e00-\u9fff]+")
+BM25_TOKEN_EXPANSIONS = {
+    "visa": ("\u4fe1\u7528\u5361", "\u56fd\u9645\u4fe1\u7528\u5361", "\u56fd\u9645\u94f6\u884c\u5361", "\u94f6\u884c\u5361"),
+    "mastercard": ("\u4fe1\u7528\u5361", "\u56fd\u9645\u4fe1\u7528\u5361", "\u56fd\u9645\u94f6\u884c\u5361", "\u94f6\u884c\u5361"),
+}
 HEADING_RE = re.compile(r"^[ \t]*#{1,6}\s+.+$")
 THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,}|(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$")
 PDF_PAGE_LABEL_RE = re.compile(r"^[ \t]*(?:page[ \t]+\d+|第[ \t]*\d+[ \t]*页)[ \t]*$", re.IGNORECASE)
@@ -172,6 +180,62 @@ def ingest_chunks(chunks: list[Chunk], persist_dir: Path, collection_name: str) 
     )
 
 
+def default_bm25_index_path(persist_dir: Path) -> Path:
+    """Return the default BM25 index path next to the Chroma store."""
+
+    return persist_dir / DEFAULT_BM25_INDEX_NAME
+
+
+def tokenize_for_bm25(text: str) -> list[str]:
+    """Tokenize mixed Chinese/English text for BM25 keyword matching."""
+
+    tokens: list[str] = []
+    for match in ALNUM_TOKEN_RE.finditer(text):
+        value = match.group(0).lower()
+        if len(value) >= 2:
+            tokens.append(value)
+            tokens.extend(BM25_TOKEN_EXPANSIONS.get(value, ()))
+
+    for match in CJK_TEXT_RE.finditer(text):
+        value = match.group(0)
+        if len(value) >= 2:
+            tokens.append(value)
+        for size in (2, 3):
+            if len(value) >= size:
+                for index in range(len(value) - size + 1):
+                    tokens.append(value[index : index + size])
+
+    return tokens
+
+
+def build_bm25_index(chunks: list[Chunk]) -> dict[str, Any]:
+    """Build a JSON-serializable BM25 index for retrieved chunks."""
+
+    return {
+        "version": 1,
+        "chunks": [
+            {
+                "id": _chunk_id(chunk),
+                "text": chunk.text,
+                "metadata": chunk.metadata,
+                "tokens": tokenize_for_bm25(chunk.text),
+            }
+            for chunk in chunks
+        ],
+    }
+
+
+def write_bm25_index(chunks: list[Chunk], index_path: Path) -> None:
+    """Persist a full BM25 index for all current chunks."""
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index = build_bm25_index(chunks)
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
 
@@ -181,6 +245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--persist-dir", type=Path, default=DEFAULT_PERSIST_DIR)
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    parser.add_argument(
+        "--bm25-index",
+        type=Path,
+        default=None,
+        help="Path for the persisted BM25 index. Defaults to <persist-dir>/bm25_index.json.",
+    )
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
     return parser.parse_args()
@@ -192,6 +262,11 @@ def main() -> int:
     args = parse_args()
     data_dir = args.data_dir.resolve()
     persist_dir = args.persist_dir.resolve()
+    bm25_index_path = (
+        args.bm25_index.resolve()
+        if args.bm25_index is not None
+        else default_bm25_index_path(persist_dir)
+    )
 
     document_files = discover_document_files(data_dir)
     chunks, files_read, errors = build_chunks_for_files(
@@ -201,6 +276,7 @@ def main() -> int:
         args.chunk_overlap,
     )
     ingest_chunks(chunks, persist_dir, args.collection)
+    write_bm25_index(chunks, bm25_index_path)
 
     for error in errors:
         print(f"Skipped file: {error}")
@@ -209,6 +285,7 @@ def main() -> int:
     print(f"Chunks written: {len(chunks)}")
     print(f"Collection: {args.collection}")
     print(f"Chroma path: {persist_dir}")
+    print(f"BM25 index: {bm25_index_path}")
     return 0
 
 

@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,13 +18,17 @@ from ai_knowledge_demo.ask import (
     dedupe_chunks,
     format_answer,
     format_answer_with_queries,
+    format_chunk_source_details,
     format_context,
     format_source,
     generate_search_queries,
     normalize_answer_template,
+    parse_args,
     parse_search_queries,
     rerank_chunks,
+    retrieve_bm25_chunks,
 )
+from ai_knowledge_demo.ingest import Chunk, write_bm25_index
 
 
 class AskTests(unittest.TestCase):
@@ -124,6 +129,23 @@ class AskTests(unittest.TestCase):
         self.assertIn("- refund time?", output)
         self.assertIn("- refund arrival days", output)
         self.assertIn("refund_policy.md#chunk=3", output)
+
+    def test_format_answer_prints_source_with_vector_and_keyword_scores(self) -> None:
+        chunk = RetrievedChunk(
+            text="Refunds are returned in 3-5 business days after approval.",
+            metadata={"source": "refund_policy.md", "chunk_index": 3},
+            distance=1.0,
+            bm25_score=4.0,
+        )
+
+        source_details = format_chunk_source_details(chunk, max_bm25_score=8.0)
+        output = format_answer_with_queries("answer", [chunk])
+
+        self.assertIn("refund_policy.md#chunk=3", source_details)
+        self.assertIn("\u5411\u91cf\u6743\u91cd\u5206=1.000", source_details)
+        self.assertIn("\u5173\u952e\u8bcd\u6743\u91cd\u5206=5.000", source_details)
+        self.assertIn("\u5411\u91cf\u6743\u91cd\u5206=", output)
+        self.assertIn("\u5173\u952e\u8bcd\u6743\u91cd\u5206=", output)
 
     def test_ollama_payload_uses_local_model_and_context(self) -> None:
         chunks = [
@@ -306,6 +328,74 @@ class AskTests(unittest.TestCase):
         )
 
         self.assertEqual(reranked[0].metadata["chunk_index"], 4)
+
+    def test_bm25_retrieval_matches_exact_card_brand_and_refund_timing(self) -> None:
+        chunks = [
+            Chunk(
+                text="## 支付方式支持\n\n平台支持 Visa 信用卡和 MasterCard。",
+                metadata={"source": "payment_and_membership_rules.md", "chunk_index": 1},
+            ),
+            Chunk(
+                text=(
+                    "## 退款到账时间\n\n"
+                    "审核通过后，款项将在 3-5 个工作日内原路返回。\n"
+                    "部分国际银行卡退款时间可能延长至 7-15 个工作日。"
+                ),
+                metadata={"source": "refund_policy.md", "chunk_index": 2},
+            ),
+            Chunk(
+                text="## 发票说明\n\n电子发票将在支付成功后 1 小时内生成。",
+                metadata={"source": "invoice.md", "chunk_index": 0},
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / "bm25_index.json"
+            write_bm25_index(chunks, index_path)
+            retrieved = retrieve_bm25_chunks(["Visa 退款需要多久？"], index_path, 4)
+
+        sources = {format_source(chunk.metadata) for chunk in retrieved}
+        self.assertIn("payment_and_membership_rules.md#chunk=1", sources)
+        self.assertIn("refund_policy.md#chunk=2", sources)
+        self.assertTrue(all((chunk.bm25_score or 0) > 0 for chunk in retrieved))
+
+    def test_bm25_retrieval_returns_empty_when_index_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_path = Path(temp_dir) / "missing.json"
+            retrieved = retrieve_bm25_chunks(["退款多久到账？"], missing_path, 4)
+
+        self.assertEqual(retrieved, [])
+
+    def test_rerank_uses_bm25_score_with_keyword_and_vector_signals(self) -> None:
+        chunks = [
+            RetrievedChunk(
+                text="## 发票说明\n\n电子发票将在支付成功后 1 小时内生成。",
+                metadata={"source": "invoice.md", "chunk_index": 0},
+                distance=0.2,
+            ),
+            RetrievedChunk(
+                text="## 退款到账时间\n\n部分国际银行卡退款时间可能延长至 7-15 个工作日。",
+                metadata={"source": "refund_policy.md", "chunk_index": 2},
+                distance=1.5,
+                bm25_score=8.0,
+            ),
+        ]
+
+        reranked = rerank_chunks("Visa 退款需要多久？", chunks, top_k=1)
+
+        self.assertEqual(reranked[0].metadata["chunk_index"], 2)
+
+    def test_parse_args_supports_bm25_controls(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["ai-knowledge-ask", "q", "--bm25-index", "custom.json", "--no-bm25"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.question, "q")
+        self.assertEqual(args.bm25_index, Path("custom.json"))
+        self.assertTrue(args.no_bm25)
 
 
 if __name__ == "__main__":

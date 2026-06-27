@@ -13,7 +13,13 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ai_knowledge_demo.ingest import DEFAULT_COLLECTION, DEFAULT_PERSIST_DIR
+from ai_knowledge_demo.ingest import (
+    BM25_TOKEN_EXPANSIONS,
+    DEFAULT_COLLECTION,
+    DEFAULT_PERSIST_DIR,
+    default_bm25_index_path,
+    tokenize_for_bm25,
+)
 
 
 DEFAULT_MODEL = "qwen2.5:7b"
@@ -22,6 +28,8 @@ DEFAULT_TOP_K = 4
 DEFAULT_MIN_RECALL = 20
 DEFAULT_RECALL_MULTIPLIER = 5
 DEFAULT_QUERY_REWRITE_COUNT = 4
+VECTOR_SCORE_WEIGHT = 2.0
+BM25_SCORE_WEIGHT = 10.0
 NO_CONTEXT_MESSAGE = "\u77e5\u8bc6\u5e93\u4e2d\u6ca1\u6709\u627e\u5230\u76f8\u5173\u4fe1\u606f\u3002"
 CONCLUSION_LABEL = "\u7ed3\u8bba\uff1a"
 CONFIRMED_LABEL = "\u53ef\u4ee5\u786e\u8ba4\uff1a"
@@ -55,6 +63,7 @@ class RetrievedChunk:
     text: str
     metadata: Mapping[str, Any]
     distance: float | None = None
+    bm25_score: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +76,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--persist-dir", type=Path, default=DEFAULT_PERSIST_DIR)
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    parser.add_argument(
+        "--bm25-index",
+        type=Path,
+        default=None,
+        help="Path to the persisted BM25 index. Defaults to <persist-dir>/bm25_index.json.",
+    )
+    parser.add_argument(
+        "--no-bm25",
+        action="store_true",
+        help="Disable BM25 keyword retrieval and use vector retrieval only.",
+    )
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL))
     return parser.parse_args()
@@ -78,8 +98,10 @@ def retrieve_chunks(
     collection_name: str,
     top_k: int = DEFAULT_TOP_K,
     search_queries: list[str] | None = None,
+    bm25_index_path: Path | None = None,
+    use_bm25: bool = True,
 ) -> list[RetrievedChunk]:
-    """Retrieve relevant chunks from a persistent Chroma collection."""
+    """Retrieve relevant chunks with Chroma vector search and optional BM25."""
 
     if top_k <= 0:
         raise ValueError("top_k must be greater than 0")
@@ -102,8 +124,69 @@ def retrieve_chunks(
         n_results=candidate_count,
         include=["documents", "metadatas", "distances"],
     )
-    candidates = dedupe_chunks(chunks_from_query_result(result))
+    candidates = chunks_from_query_result(result)
+    if use_bm25:
+        bm25_path = bm25_index_path or default_bm25_index_path(persist_dir)
+        candidates.extend(retrieve_bm25_chunks(queries, bm25_path, candidate_count))
+
+    candidates = dedupe_chunks(candidates)
     return rerank_chunks(question, candidates, top_k, scoring_queries=queries)
+
+
+def retrieve_bm25_chunks(
+    queries: list[str],
+    index_path: Path,
+    candidate_count: int,
+) -> list[RetrievedChunk]:
+    """Retrieve keyword-matched chunks from the persisted BM25 index."""
+
+    if candidate_count <= 0 or not index_path.exists():
+        return []
+
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    entries = [
+        entry
+        for entry in index.get("chunks", [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("text"), str)
+        and isinstance(entry.get("tokens"), list)
+    ]
+    if not entries:
+        return []
+
+    from rank_bm25 import BM25Okapi
+
+    corpus = [[str(token) for token in entry["tokens"]] for entry in entries]
+    bm25 = BM25Okapi(corpus)
+    scores = [0.0 for _entry in entries]
+    for query in queries:
+        query_tokens = tokenize_for_bm25(query)
+        if not query_tokens:
+            continue
+        for index, score in enumerate(bm25.get_scores(query_tokens)):
+            scores[index] += float(score)
+
+    ranked_indexes = sorted(
+        (index for index, score in enumerate(scores) if score > 0),
+        key=lambda index: (-scores[index], index),
+    )[:candidate_count]
+
+    chunks: list[RetrievedChunk] = []
+    for index in ranked_indexes:
+        entry = entries[index]
+        metadata = entry.get("metadata")
+        chunks.append(
+            RetrievedChunk(
+                text=str(entry["text"]),
+                metadata=metadata if isinstance(metadata, dict) else {},
+                bm25_score=scores[index],
+            )
+        )
+    return chunks
 
 
 def chunks_from_query_result(result: Mapping[str, Any]) -> list[RetrievedChunk]:
@@ -135,7 +218,7 @@ def chunks_from_query_result(result: Mapping[str, Any]) -> list[RetrievedChunk]:
 
 
 def dedupe_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
-    """Deduplicate chunks from multiple retrieval queries, keeping best distance."""
+    """Deduplicate chunks, keeping best vector distance and BM25 score."""
 
     by_key: dict[str, RetrievedChunk] = {}
     order: list[str] = []
@@ -150,12 +233,28 @@ def dedupe_chunks(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
             order.append(key)
             continue
 
-        existing_distance = existing.distance if existing.distance is not None else float("inf")
-        chunk_distance = chunk.distance if chunk.distance is not None else float("inf")
-        if chunk_distance < existing_distance:
-            by_key[key] = chunk
+        by_key[key] = merge_retrieved_chunks(existing, chunk)
 
     return [by_key[key] for key in order]
+
+
+def merge_retrieved_chunks(existing: RetrievedChunk, chunk: RetrievedChunk) -> RetrievedChunk:
+    """Merge duplicate retrieval hits from different retrieval methods."""
+
+    existing_distance = existing.distance if existing.distance is not None else float("inf")
+    chunk_distance = chunk.distance if chunk.distance is not None else float("inf")
+    distance = min(existing_distance, chunk_distance)
+    if distance == float("inf"):
+        distance = None
+
+    bm25_score = max(existing.bm25_score or 0.0, chunk.bm25_score or 0.0)
+    best_chunk = chunk if chunk_distance < existing_distance else existing
+    return RetrievedChunk(
+        text=best_chunk.text,
+        metadata=best_chunk.metadata,
+        distance=distance,
+        bm25_score=bm25_score or None,
+    )
 
 
 def format_context(chunks: list[RetrievedChunk]) -> str:
@@ -182,7 +281,7 @@ def rerank_chunks(
     top_k: int,
     scoring_queries: list[str] | None = None,
 ) -> list[RetrievedChunk]:
-    """Rerank vector candidates with lightweight keyword matching."""
+    """Rerank hybrid candidates with keyword, BM25, and vector signals."""
 
     if top_k <= 0:
         raise ValueError("top_k must be greater than 0")
@@ -190,16 +289,63 @@ def rerank_chunks(
         return []
 
     queries = scoring_queries or [question]
+    max_bm25_score = max((chunk.bm25_score or 0.0 for chunk in chunks), default=0.0)
     scored_chunks = [
         (
-            -sum(keyword_score(query, chunk) for query in queries),
+            -hybrid_score(chunk, queries, max_bm25_score),
             chunk.distance if chunk.distance is not None else float("inf"),
             index,
             chunk,
         )
         for index, chunk in enumerate(chunks)
     ]
-    return [chunk for *_unused, chunk in sorted(scored_chunks)[:top_k]]
+    ranked_chunks = [chunk for *_unused, chunk in sorted(scored_chunks)]
+    selected_chunks = ranked_chunks[:top_k]
+    if max_bm25_score > 0 and top_k > 1:
+        bm25_leader = max(
+            chunks,
+            key=lambda chunk: (chunk.bm25_score or 0.0, -chunks.index(chunk)),
+        )
+        if bm25_leader not in selected_chunks:
+            selected_chunks = [
+                bm25_leader,
+                *[chunk for chunk in selected_chunks if chunk is not bm25_leader],
+            ][:top_k]
+
+    return selected_chunks
+
+
+def hybrid_score(
+    chunk: RetrievedChunk,
+    queries: list[str],
+    max_bm25_score: float,
+) -> float:
+    """Combine exact keyword, BM25, and vector distance into one score."""
+
+    keyword_total = sum(keyword_score(query, chunk) for query in queries)
+    bm25_score = chunk.bm25_score or 0.0
+    normalized_bm25 = bm25_score / max_bm25_score if max_bm25_score > 0 else 0.0
+    return (
+        keyword_total
+        + normalized_bm25 * BM25_SCORE_WEIGHT
+        + vector_weight_score(chunk)
+    )
+
+
+def vector_weight_score(chunk: RetrievedChunk) -> float:
+    """Return the weighted vector contribution used by hybrid reranking."""
+
+    if chunk.distance is None:
+        return 0.0
+    return (1.0 / (1.0 + chunk.distance)) * VECTOR_SCORE_WEIGHT
+
+
+def keyword_weight_score(chunk: RetrievedChunk, max_bm25_score: float) -> float:
+    """Return the weighted BM25 keyword contribution used by hybrid reranking."""
+
+    if max_bm25_score <= 0:
+        return 0.0
+    return ((chunk.bm25_score or 0.0) / max_bm25_score) * BM25_SCORE_WEIGHT
 
 
 def keyword_score(question: str, chunk: RetrievedChunk) -> float:
@@ -238,6 +384,7 @@ def extract_query_terms(question: str) -> list[str]:
         value = match.group(0).lower()
         if len(value) >= 2:
             terms.add(value)
+            terms.update(BM25_TOKEN_EXPANSIONS.get(value, ()))
 
     for match in re.finditer(r"[\u4e00-\u9fff]+", question):
         value = match.group(0)
@@ -517,11 +664,23 @@ def format_answer_with_queries(
     if not chunks:
         return "\n\n".join(output_parts)
 
+    max_bm25_score = max((chunk.bm25_score or 0.0 for chunk in chunks), default=0.0)
     source_blocks = "\n\n".join(
-        f"- {format_source(chunk.metadata)}\n{chunk.text}" for chunk in chunks
+        f"- {format_chunk_source_details(chunk, max_bm25_score)}\n{chunk.text}"
+        for chunk in chunks
     )
     output_parts.append(f"\u6765\u6e90\uff1a\n{source_blocks}")
     return "\n\n".join(output_parts)
+
+
+def format_chunk_source_details(chunk: RetrievedChunk, max_bm25_score: float) -> str:
+    """Format source and retrieval score details for CLI output."""
+
+    return (
+        f"{format_source(chunk.metadata)} | "
+        f"\u5411\u91cf\u6743\u91cd\u5206={vector_weight_score(chunk):.3f} | "
+        f"\u5173\u952e\u8bcd\u6743\u91cd\u5206={keyword_weight_score(chunk, max_bm25_score):.3f}"
+    )
 
 
 def format_search_queries(search_queries: list[str]) -> str:
@@ -548,6 +707,12 @@ def main() -> int:
             collection_name=args.collection,
             top_k=args.top_k,
             search_queries=search_queries,
+            bm25_index_path=(
+                args.bm25_index.resolve()
+                if args.bm25_index is not None
+                else None
+            ),
+            use_bm25=not args.no_bm25,
         )
         answer = answer_question(args.question, chunks, args.model, args.ollama_url)
     except (RuntimeError, ValueError) as exc:

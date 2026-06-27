@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -8,9 +9,14 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 from ai_knowledge_demo.ingest import (
+    Chunk,
+    build_bm25_index,
     chunk_markdown,
+    default_bm25_index_path,
     discover_document_files,
     read_document_file,
+    tokenize_for_bm25,
+    write_bm25_index,
 )
 
 
@@ -246,6 +252,55 @@ class IngestChunkTests(unittest.TestCase):
             ],
         )
         self.assertFalse(any(chunk.text.strip() in {"---", "***", "___", "- - -"} for chunk in chunks))
+
+    def test_bm25_index_preserves_chunks_metadata_and_tokens(self) -> None:
+        chunks = [
+            Chunk(
+                text="Visa 信用卡退款通常需要 7-15 个工作日。",
+                metadata={
+                    "source": "refund_policy.md",
+                    "chunk_index": 2,
+                    "start_char": 10,
+                    "end_char": 42,
+                },
+            )
+        ]
+
+        index = build_bm25_index(chunks)
+
+        self.assertEqual(index["version"], 1)
+        self.assertEqual(len(index["chunks"]), 1)
+        self.assertEqual(index["chunks"][0]["id"], "refund_policy.md:2")
+        self.assertEqual(index["chunks"][0]["metadata"]["source"], "refund_policy.md")
+        self.assertEqual(index["chunks"][0]["metadata"]["chunk_index"], 2)
+        self.assertIn("visa", index["chunks"][0]["tokens"])
+        self.assertIn("退款", index["chunks"][0]["tokens"])
+        self.assertIn("信用卡", index["chunks"][0]["tokens"])
+
+    def test_write_bm25_index_uses_default_path_and_writes_json(self) -> None:
+        chunks = [
+            Chunk(
+                text="Refunds arrive in 3-5 business days.",
+                metadata={"source": "refund_policy.md", "chunk_index": 0},
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = default_bm25_index_path(Path(temp_dir))
+            write_bm25_index(chunks, index_path)
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(index_path.name, "bm25_index.json")
+        self.assertEqual(len(data["chunks"]), 1)
+        self.assertEqual(data["chunks"][0]["metadata"]["chunk_index"], 0)
+
+    def test_bm25_tokenizer_expands_card_brands(self) -> None:
+        tokens = tokenize_for_bm25("Visa 退款需要多久？")
+
+        self.assertIn("visa", tokens)
+        self.assertIn("信用卡", tokens)
+        self.assertIn("国际银行卡", tokens)
+        self.assertIn("退款", tokens)
 
 
 if __name__ == "__main__":
