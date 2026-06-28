@@ -60,6 +60,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable BM25 keyword retrieval and use vector retrieval only.",
     )
+    parser.add_argument(
+        "--no-vector",
+        action="store_true",
+        help="Disable Chroma vector retrieval and use BM25 keyword retrieval only.",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable hybrid reranking and keep retrieval order.",
+    )
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL))
     parser.add_argument(
@@ -135,6 +145,8 @@ def evaluate_cases(
     ollama_url: str,
     retrieval_only: bool,
     use_query_rewrite: bool,
+    use_vector: bool = True,
+    use_rerank: bool = True,
 ) -> list[EvalResult]:
     """Evaluate all cases and return per-case results."""
 
@@ -146,6 +158,8 @@ def evaluate_cases(
             top_k=top_k,
             bm25_index_path=bm25_index_path,
             use_bm25=use_bm25,
+            use_vector=use_vector,
+            use_rerank=use_rerank,
             model=model,
             ollama_url=ollama_url,
             retrieval_only=retrieval_only,
@@ -167,6 +181,8 @@ def evaluate_case(
     ollama_url: str,
     retrieval_only: bool,
     use_query_rewrite: bool,
+    use_vector: bool = True,
+    use_rerank: bool = True,
 ) -> EvalResult:
     """Evaluate one case against retrieval and, optionally, generated answer text."""
 
@@ -184,6 +200,8 @@ def evaluate_case(
         search_queries=search_queries,
         bm25_index_path=bm25_index_path,
         use_bm25=use_bm25,
+        use_vector=use_vector,
+        use_rerank=use_rerank,
     )
 
     failures = check_retrieval(chunks, case.get("expected_sources", []))
@@ -307,6 +325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             top_k=args.top_k,
             bm25_index_path=args.bm25_index.resolve() if args.bm25_index is not None else None,
             use_bm25=not args.no_bm25,
+            use_vector=not args.no_vector,
+            use_rerank=not args.no_rerank,
             model=args.model,
             ollama_url=args.ollama_url,
             retrieval_only=args.retrieval_only,

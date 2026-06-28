@@ -87,6 +87,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable BM25 keyword retrieval and use vector retrieval only.",
     )
+    parser.add_argument(
+        "--no-vector",
+        action="store_true",
+        help="Disable Chroma vector retrieval and use BM25 keyword retrieval only.",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Disable hybrid reranking and keep retrieval order.",
+    )
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL))
     return parser.parse_args()
@@ -100,37 +110,43 @@ def retrieve_chunks(
     search_queries: list[str] | None = None,
     bm25_index_path: Path | None = None,
     use_bm25: bool = True,
+    use_vector: bool = True,
+    use_rerank: bool = True,
 ) -> list[RetrievedChunk]:
-    """Retrieve relevant chunks with Chroma vector search and optional BM25."""
+    """Retrieve relevant chunks with optional Chroma vector search, BM25, and rerank."""
 
     if top_k <= 0:
         raise ValueError("top_k must be greater than 0")
 
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(persist_dir))
-    collection = client.get_collection(name=collection_name)
-    collection_count = collection.count()
-    if collection_count == 0:
-        return []
-
-    candidate_count = min(
-        collection_count,
-        max(top_k * DEFAULT_RECALL_MULTIPLIER, DEFAULT_MIN_RECALL),
-    )
     queries = search_queries or [question]
-    result = collection.query(
-        query_texts=queries,
-        n_results=candidate_count,
-        include=["documents", "metadatas", "distances"],
-    )
-    candidates = chunks_from_query_result(result)
+    candidates: list[RetrievedChunk] = []
+    base_candidate_count = max(top_k * DEFAULT_RECALL_MULTIPLIER, DEFAULT_MIN_RECALL)
+    candidate_count = base_candidate_count
+
+    if use_vector:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=str(persist_dir))
+        collection = client.get_collection(name=collection_name)
+        collection_count = collection.count()
+        if collection_count == 0:
+            return []
+        candidate_count = min(collection_count, base_candidate_count)
+        result = collection.query(
+            query_texts=queries,
+            n_results=candidate_count,
+            include=["documents", "metadatas", "distances"],
+        )
+        candidates.extend(chunks_from_query_result(result))
+
     if use_bm25:
         bm25_path = bm25_index_path or default_bm25_index_path(persist_dir)
         candidates.extend(retrieve_bm25_chunks(queries, bm25_path, candidate_count))
 
     candidates = dedupe_chunks(candidates)
-    return rerank_chunks(question, candidates, top_k, scoring_queries=queries)
+    if use_rerank:
+        return rerank_chunks(question, candidates, top_k, scoring_queries=queries)
+    return candidates[:top_k]
 
 
 def retrieve_bm25_chunks(
@@ -713,6 +729,8 @@ def main() -> int:
                 else None
             ),
             use_bm25=not args.no_bm25,
+            use_vector=not args.no_vector,
+            use_rerank=not args.no_rerank,
         )
         answer = answer_question(args.question, chunks, args.model, args.ollama_url)
     except (RuntimeError, ValueError) as exc:

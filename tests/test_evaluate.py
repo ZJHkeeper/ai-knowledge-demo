@@ -253,6 +253,17 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("[FAIL] bad", output.getvalue())
 
+    def test_main_passes_vector_and_rerank_controls(self) -> None:
+        with (
+            patch("ai_knowledge_demo.evaluate.load_cases", return_value=[]),
+            patch("ai_knowledge_demo.evaluate.evaluate_cases", return_value=[]) as evaluate,
+        ):
+            exit_code = main(["--retrieval-only", "--no-vector", "--no-rerank"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(evaluate.call_args.kwargs["use_vector"])
+        self.assertFalse(evaluate.call_args.kwargs["use_rerank"])
+
     def test_main_reports_ollama_error_clearly(self) -> None:
         error_output = io.StringIO()
         with (

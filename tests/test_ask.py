@@ -27,6 +27,7 @@ from ai_knowledge_demo.ask import (
     parse_search_queries,
     rerank_chunks,
     retrieve_bm25_chunks,
+    retrieve_chunks,
 )
 from ai_knowledge_demo.ingest import Chunk, write_bm25_index
 
@@ -385,17 +386,62 @@ class AskTests(unittest.TestCase):
 
         self.assertEqual(reranked[0].metadata["chunk_index"], 2)
 
-    def test_parse_args_supports_bm25_controls(self) -> None:
+    def test_retrieve_chunks_can_disable_vector_and_rerank(self) -> None:
+        index_path = Path("custom_bm25.json")
+        bm25_chunks = [
+            RetrievedChunk(
+                text="first",
+                metadata={"source": "first.md", "chunk_index": 0},
+                bm25_score=3.0,
+            ),
+            RetrievedChunk(
+                text="second",
+                metadata={"source": "second.md", "chunk_index": 1},
+                bm25_score=2.0,
+            ),
+        ]
+
+        with (
+            patch("ai_knowledge_demo.ask.retrieve_bm25_chunks", return_value=bm25_chunks) as bm25,
+            patch("ai_knowledge_demo.ask.rerank_chunks") as rerank,
+        ):
+            retrieved = retrieve_chunks(
+                question="q",
+                persist_dir=Path("unused"),
+                collection_name="unused",
+                top_k=1,
+                search_queries=["q"],
+                bm25_index_path=index_path,
+                use_bm25=True,
+                use_vector=False,
+                use_rerank=False,
+            )
+
+        self.assertEqual(retrieved, bm25_chunks[:1])
+        bm25.assert_called_once_with(["q"], index_path, 20)
+        rerank.assert_not_called()
+
+    def test_parse_args_supports_retrieval_controls(self) -> None:
         with patch.object(
             sys,
             "argv",
-            ["ai-knowledge-ask", "q", "--bm25-index", "custom.json", "--no-bm25"],
+            [
+                "ai-knowledge-ask",
+                "q",
+                "--bm25-index",
+                "custom.json",
+                "--no-bm25",
+                "--no-vector",
+                "--no-rerank",
+            ],
         ):
             args = parse_args()
 
         self.assertEqual(args.question, "q")
         self.assertEqual(args.bm25_index, Path("custom.json"))
         self.assertTrue(args.no_bm25)
+        self.assertTrue(args.no_vector)
+        self.assertTrue(args.no_rerank)
 
 
 if __name__ == "__main__":
